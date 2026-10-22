@@ -1,0 +1,10 @@
+{
+  "name": "munova-ultimate",
+  "version": "3.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vercel dev",
+    "check": "node scripts/check-deploy.mjs"
+  }
+}
