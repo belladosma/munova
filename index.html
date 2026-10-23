@@ -1078,4 +1078,285 @@ render();
 })();
 
 </script>
-</body></html> 
+<script>
+/* MUNOVA Workspace Continuity 2.0 — additive fix; keep existing Gemini API and Firebase integration. */
+(function(){
+ 'use strict';
+ if(window.__munovaContinuityV2) return;
+ window.__munovaContinuityV2=true;
+ const LEGACY='munova.ultra.v1', REGKEY='munova.workspaces.registry.v2';
+ const DB='munova-workspace-backups-v2', STORE='workspaces';
+ const guid=()=>window.crypto?.randomUUID?.()||('mun-'+Date.now()+'-'+Math.random().toString(36).slice(2));
+ const deep=v=>JSON.parse(JSON.stringify(v));
+ const initialId=S.workspaceId||guid();
+ S.workspaceId=initialId;
+ S.workspaceStatus=S.workspaceStatus||'active';
+ let registry;
+ try{registry=JSON.parse(localStorage.getItem(REGKEY)||'null')}catch{}
+ if(!registry||!Array.isArray(registry.items)) registry={activeId:initialId,items:[]};
+ if(!registry.items.some(x=>x.id===initialId))registry.items.push({id:initialId,name:S.settings.conference||'Mi MUN',updatedAt:new Date().toISOString(),agenda:S.settings.agenda||''});
+ registry.activeId=initialId;
+ function safeRegistry(){try{localStorage.setItem(REGKEY,JSON.stringify(registry))}catch(e){console.warn('MUNOVA registry',e)}}
+ safeRegistry();
+ const storeState=(state)=>new Promise((resolve,reject)=>{
+   if(!window.indexedDB){reject(Error('IndexedDB no disponible'));return}
+   const req=indexedDB.open(DB,1);
+   req.onupgradeneeded=()=>{if(!req.result.objectStoreNames.contains(STORE))req.result.createObjectStore(STORE)};
+   req.onerror=()=>reject(req.error||Error('Error al abrir archivos'));
+   req.onsuccess=()=>{const db=req.result;const tx=db.transaction(STORE,'readwrite');tx.objectStore(STORE).put(state,state.workspaceId);tx.oncomplete=()=>{db.close();resolve()};tx.onerror=()=>{db.close();reject(tx.error||Error('No se pudo escribir'))}};
+ });
+ const loadState=(id)=>new Promise((resolve,reject)=>{
+   const req=indexedDB.open(DB,1);req.onupgradeneeded=()=>{if(!req.result.objectStoreNames.contains(STORE))req.result.createObjectStore(STORE)};
+   req.onerror=()=>reject(req.error);
+   req.onsuccess=()=>{const db=req.result;const tx=db.transaction(STORE,'readonly');const get=tx.objectStore(STORE).get(id);get.onsuccess=()=>resolve(get.result||null);get.onerror=()=>reject(get.error);tx.oncomplete=()=>db.close()};
+ });
+ let flushing=Promise.resolve(), flushTimer, latestVersion=0, warned=false, booting=true;
+ function slimState(src){
+   const x={...src,handbook:{...src.handbook,text:'',pages:[]},viewer:{...src.viewer,url:''},documents:(src.documents||[]).slice(-24).map(d=>({...d,body:String(d.body||'').slice(0,1300)})),interventions:(src.interventions||[]).slice(-55),drafts:{...src.drafts}};
+   for(const key of Object.keys(x.drafts))if(typeof x.drafts[key]==='string'&&x.drafts[key].length>14000)x.drafts[key]=x.drafts[key].slice(-14000);
+   delete x.firebase;
+   return x;
+ }
+ function displaySave(label,color){const el=document.getElementById('munovaV2Save');if(el){el.textContent=label;el.dataset.status=color||'good'}const legacy=document.getElementById('saveStatus');if(legacy&&color!=='bad')legacy.textContent=label}
+ function stamp(){return new Date().toISOString()}
+ function queueWrite(){
+   clearTimeout(flushTimer);latestVersion++;
+   flushTimer=setTimeout(()=>{persistNow().catch(console.warn)},400);
+ }
+ async function persistNow(){
+   clearTimeout(flushTimer);
+   const obj=deep({...S,viewer:{...S.viewer,url:(S.viewer?.url||'').startsWith('blob:')?'':S.viewer?.url||''}});
+   const v=latestVersion;
+   flushing=flushing.catch(()=>{}).then(()=>storeState(obj));
+   try{await flushing;if(v===latestVersion)displaySave('✓ Guardado en este equipo','good')}
+   catch(err){displaySave('⚠ No se pudo guardar: exporta copia','bad');if(!warned){warned=true;toast('No se pudo guardar en este equipo. Exporta una copia JSON desde Ajustes.')}console.warn(err);throw err}
+ }
+ const oldSave=save;
+ save=function(){
+   S.workspaceId=S.workspaceId||registry.activeId||initialId;
+   S.workspaceUpdatedAt=stamp();
+   let current=registry.items.find(x=>x.id===S.workspaceId);
+   if(!current){current={id:S.workspaceId};registry.items.push(current)}
+   Object.assign(current,{name:S.settings.conference||'Conferencia sin nombre',agenda:S.settings.agenda||'',updatedAt:S.workspaceUpdatedAt,status:S.workspaceStatus||'active'});
+   registry.activeId=S.workspaceId;
+   safeRegistry();
+   // A small emergency cache is retained for the existing boot sequence.
+   try{localStorage.setItem(LEGACY,JSON.stringify(slimState(S)))}
+   catch(err){try{const emergency={...slimState(S),documents:[],interventions:[]};localStorage.setItem(LEGACY,JSON.stringify(emergency))}catch(e){console.warn('Cache local lleno',e)}}
+   displaySave('Guardando…','pending');
+   queueWrite();
+   if(!booting)window.MunovaCloud?.schedulePush?.();
+ };
+ function applyState(record){
+   const oldCode=S.settings.accessCode||'';
+   const base=defaultState();
+   S={...base,...record};
+   S.settings={...base.settings,...(record.settings||{}),accessCode:oldCode||record.settings?.accessCode||''};
+   S.drafts={...base.drafts,...(record.drafts||{})};
+   S.handbook={...base.handbook,...(record.handbook||{})};
+   S.clauses={...base.clauses,...(record.clauses||{})};
+   S.viewer={...base.viewer,...(record.viewer||{}),url:''};
+   S.workspaceId=record.workspaceId;
+   if(!Array.isArray(S.researchFiles))S.researchFiles=[];
+   if(!Array.isArray(S.documents))S.documents=[];
+   window.MunovaGetState=()=>S;
+   save();render();
+ }
+ async function restoreAtStartup(){
+   try{
+     const id=registry.activeId;
+     const stored=await loadState(id);
+     if(stored){
+       applyState(stored);toast('Sesión MUN recuperada con sus datos y documentos.');
+     }else{
+       S.workspaceId=id;save();
+     }
+   }catch(err){console.warn('Recuperación de sesión:',err);save()}
+   finally{booting=false;decorateBar()}
+ }
+ async function switchWorkspace(id){
+   if(!id||id===S.workspaceId)return;
+   try{
+     S.drafts.liveText=document.getElementById('liveText')?.value??S.drafts.liveText;
+     await persistNow();
+     const restored=await loadState(id);
+     if(!restored){toast('No se encontró esa sesión en este navegador. Restaura su copia JSON.');return}
+     registry.activeId=id;safeRegistry();
+     applyState(restored);
+     toast('MUN abierto: '+S.settings.conference);
+   }catch(err){toast('No se pudo cambiar de MUN. Exporta una copia antes de continuar.');console.error(err)}
+ }
+ async function newWorkspace(){
+   const name=prompt('Nombre del MUN o conferencia nueva:','Mi próximo MUN');if(name===null)return;
+   if(!name.trim()){toast('Escribe el nombre de la conferencia.');return}
+   const committee=prompt('¿Qué comité vas a representar?','Comité por confirmar');if(committee===null)return;
+   const agenda=prompt('¿Cuál es el TEMA oficial de este comité?','');if(agenda===null)return;
+   try{
+     S.drafts.liveText=document.getElementById('liveText')?.value??S.drafts.liveText;
+     await persistNow();
+     const old=S;
+     S=defaultState();
+     S.workspaceId=guid();S.workspaceStatus='active';
+     S.settings={...S.settings,conference:name.trim(),committee:committee.trim()||'Comité por confirmar',agenda:agenda.trim(),accessCode:old.settings.accessCode||'',language:old.settings.language||'Español',activeCountry:''};
+     S.delegations=[];S.actors=[];S.interventions=[];S.evidence=[];S.research=[];S.researchFiles=[];S.researchLinks=[];S.documents=[];S.extraResources=[];S.motions=[];
+     S.handbook={name:'',pages:[],text:'',type:'',uploadedAt:''};S.drafts={...defaultState().drafts,liveText:'',resTitle:agenda||''};S.scenario='personal';
+     registry.activeId=S.workspaceId;save();await persistNow();render();
+     toast('Nuevo MUN creado. La sesión anterior está archivada.');
+   }catch(err){toast('No se pudo crear el MUN.');console.error(err)}
+ }
+ async function backupAll(){
+   try{
+     await persistNow();
+     const sessions=[];
+     for(const item of registry.items){const state=await loadState(item.id);if(state)sessions.push(state)}
+     downloadBlob(JSON.stringify({format:'munova-workspace-bundle-v2',createdAt:stamp(),sessions},null,2),'MUNOVA-TODOS-MIS-MUN.json','application/json');
+     toast(sessions.length+' conferencias incluidas en la copia JSON.');
+   }catch(err){console.error(err);toast('No se pudo exportar todo. Prueba la copia del MUN activo.')}
+ }
+ function restoreAll(){
+   const inp=document.createElement('input');inp.type='file';inp.accept='.json,application/json';
+   inp.onchange=async()=>{
+     const file=inp.files?.[0];if(!file)return;
+     try{
+       const payload=JSON.parse(await file.text());
+       if(payload.format!=='munova-workspace-bundle-v2'||!Array.isArray(payload.sessions))throw Error('Archivo distinto del respaldo completo MUNOVA');
+       await persistNow();
+       for(const item of payload.sessions){
+         if(!item?.workspaceId||!item.settings)continue;
+         const imported={...item,workspaceId:guid(),workspaceUpdatedAt:stamp()};
+         await storeState(imported);
+         registry.items.push({id:imported.workspaceId,name:(item.settings.conference||'MUN restaurado')+' (importado)',agenda:item.settings.agenda||'',status:item.workspaceStatus||'active',updatedAt:imported.workspaceUpdatedAt});
+       }
+       safeRegistry();render();toast('Conferencias restauradas. Selecciona cuál quieres abrir.');
+     }catch(err){toast('No se pudo importar el respaldo de todos los MUN.');console.error(err)}
+   };inp.click();
+ }
+ async function closeWorkspace(){
+   if(!confirm('¿Marcar esta conferencia como FINALIZADA? Se conservará todo su contenido y podrás volver a abrirla.'))return;
+   S.workspaceStatus='finished';save();await persistNow();render();toast('MUN finalizado y conservado en el archivo.');
+ }
+ function infoText(){return [S.settings.conference,S.settings.committee,S.settings.agenda,S.settings.activeCountry].filter(Boolean).join(' · ')}
+ function barMarkup(){return `<section id="munovaV2Bar" aria-label="Centro de sesión MUNOVA"><div class="munova-v2-primary"><b>▦ MI MUN ACTIVO</b><select id="munovaV2Select" aria-label="Cambiar conferencia">${registry.items.map(item=>`<option value="${escAttr(item.id)}" ${item.id===S.workspaceId?'selected':''}>${esc((item.status==='finished'?'✓ ':'● ')+(item.name||'MUN')+' — '+(item.agenda||'Sin tema').slice(0,50))}</option>`).join('')}</select><button type="button" data-v2="new">＋ Nuevo MUN</button><button type="button" data-v2="finish">Finalizar</button><button type="button" data-v2="export">↓ Este MUN</button><button type="button" data-v2="backupall">↓ Todos</button><button type="button" data-v2="restoreall">↑ Restaurar</button><span id="munovaV2Save" role="status">✓ Datos locales</span></div><div class="munova-v2-secondary"><label>CONFERENCIA <input id="munovaV2Conf" value="${escAttr(S.settings.conference||'')}" aria-label="Conferencia"></label><label>COMITÉ <input id="munovaV2Committee" value="${escAttr(S.settings.committee||'')}" aria-label="Comité"></label><label class="munova-v2-agenda">TEMA OFICIAL <input id="munovaV2Agenda" value="${escAttr(S.settings.agenda||'')}" placeholder="Escribe el tema del comité: la IA lo utilizará siempre" aria-label="Tema oficial"></label></div><div class="munova-v2-notes"><label>NOTAS CLAVE PARA TODA LA SESIÓN <textarea id="munovaV2Notes" rows="2" placeholder="Objetivos de tu delegación, propuesta en negociación, líneas rojas, acuerdos que Gemini debe tener presentes...">${esc(S.settings.permanentNotes||'')}</textarea></label></div><div class="munova-v2-hint">El contexto de este MUN (tema, intervenciones, evidencias, documentos y borradores) se enviará a Gemini al generar respuestas. Los datos se guardan en este navegador; exporta una copia JSON para recuperarlos en otro dispositivo.</div></section>`}
+ function decorateBar(){
+   const app=document.getElementById('app');if(!app)return;
+   const existing=document.getElementById('munovaV2Bar');if(existing)existing.remove();
+   app.insertAdjacentHTML('afterbegin',barMarkup());
+ }
+ const oldRender=render;
+ render=function(){oldRender();decorateBar()};
+ const barCss=document.createElement('style');barCss.textContent=`
+ #munovaV2Bar{padding:13px 15px;border:1px solid #cce5e5;border-radius:13px;background:linear-gradient(110deg,#f1fbfa,#f6faff);box-shadow:0 2px 12px #123d4b10;margin:0 0 18px;font-family:inherit;color:#213b4f;position:relative;z-index:5}
+ .munova-v2-primary{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.munova-v2-primary>b{font-size:11px;white-space:nowrap;color:#146c74;letter-spacing:.06em}.munova-v2-primary select{min-width:160px;flex:1;max-width:370px;border:1px solid #c6dcdf;background:white;padding:9px;border-radius:8px;color:#173b4a}.munova-v2-primary button{border:1px solid #bddbdc;border-radius:8px;background:#fff;color:#176374;font-size:12px;font-weight:700;padding:9px 11px;cursor:pointer}.munova-v2-primary button:hover{background:#e1f4f4}
+ #munovaV2Save{font-size:11px;color:#168266;white-space:nowrap}#munovaV2Save[data-status=bad]{color:#bf3c43}#munovaV2Save[data-status=pending]{color:#a67824}
+ .munova-v2-secondary{display:grid;grid-template-columns:1fr 1fr 2fr;gap:9px;margin-top:10px}.munova-v2-secondary label{display:flex;flex-direction:column;font-size:10px;font-weight:800;letter-spacing:.05em;gap:4px;color:#527287}.munova-v2-secondary input{width:100%;border:1px solid #d2e2e8;padding:10px;border-radius:7px;background:#fff;color:#153e52;font:inherit;font-size:12px;font-weight:500;box-sizing:border-box}.munova-v2-secondary input:focus{outline:2px solid #96dad4}
+ .munova-v2-notes{margin-top:9px}.munova-v2-notes label{display:flex;flex-direction:column;gap:4px;font-weight:800;font-size:10px;color:#527287}.munova-v2-notes textarea{font:inherit;font-size:12px;min-height:54px;resize:vertical;width:100%;box-sizing:border-box;border:1px solid #d2e2e8;border-radius:7px;padding:9px;color:#173b4a;background:white}.munova-v2-hint{font-size:10px;color:#648094;margin-top:8px;line-height:1.45}
+ @media(max-width:820px){.munova-v2-secondary{grid-template-columns:1fr}.munova-v2-primary select{max-width:none;flex-basis:100%}}
+ `;document.head.appendChild(barCss);
+ document.addEventListener('change',function(e){
+  const id=e.target?.id;
+  if(id==='munovaV2Select'){switchWorkspace(e.target.value);return}
+  const map={munovaV2Conf:'conference',munovaV2Committee:'committee',munovaV2Agenda:'agenda'};
+  if(map[id]){S.settings[map[id]]=e.target.value;save();if(id==='munovaV2Agenda'){S.drafts.resTitle=S.drafts.resTitle||e.target.value}decorateBar()}
+ });
+ document.addEventListener('input',function(e){const map={munovaV2Conf:'conference',munovaV2Committee:'committee',munovaV2Agenda:'agenda'};const fld=map[e.target?.id];if(fld){S.settings[fld]=e.target.value;save()}if(e.target?.id==='munovaV2Notes'){S.settings.permanentNotes=e.target.value;save()}});
+ document.addEventListener('click',function(e){const b=e.target.closest('[data-v2]');if(!b)return;switch(b.dataset.v2){case 'new':newWorkspace();break;case 'finish':closeWorkspace();break;case 'export':exportData();break;case 'backupall':backupAll();break;case 'restoreall':restoreAll();break}}
+ );
+ // Restore the committee documents' *indexed text*, rather than sending only file names to AI.
+ const baseAI=aiContext;
+ aiContext=function(extra={}){
+   const result=baseAI(extra);
+   const recentTexts=(S.interventions||[]).slice(-24).map(i=>({country:i.country,text:i.text,time:i.time,type:i.type}));
+   return {...result,
+     sessionMemory:{id:S.workspaceId,conference:S.settings.conference,committee:S.settings.committee,officialAgenda:S.settings.agenda,phase:S.settings.session,status:S.workspaceStatus,delegation:S.settings.activeCountry,delegate:S.settings.activeDelegate},
+     savedSessionNotes:{latestInterventions:recentTexts,permanentNotes:S.settings.permanentNotes||'',pendingQuestions:(S.research||[]).filter(x=>x.status!=='Resuelta').slice(-18),approvedSolutions:(S.solutionIdeas||[]).filter(x=>x.status==='Aprobada').slice(-12),operativeClauses:(S.clauses?.operative||[]).slice(-24),preambularClauses:(S.clauses?.preambular||[]).slice(-24),resolutionsDraft:{title:S.drafts.resTitle,problem:S.drafts.resProblem,mechanism:S.drafts.resMechanism,financing:S.drafts.resFunding,implementer:S.drafts.resImplementer,indicators:S.drafts.resIndicators},lastSavedDocuments:(S.documents||[]).slice(-5).map(d=>({title:d.title,type:d.type,preview:String(d.body||'').slice(0,700)}))},
+     documentsOfCommittee:(S.researchFiles||[]).filter(f=>f.collection==='committee').map(f=>({id:f.id,name:f.name,pages:f.pages,characters:f.chars})),
+     permanentContextRule:'Respeta sin pedir de nuevo el tema oficial, nombre de conferencia, comité, país y los documentos y evidencias asociados. Construye la respuesta sobre la información recuperada abajo, distingue hechos de posturas o datos hipotéticos, indica los archivos y páginas usados. NO supongas que todo el handbook aplica al tema actual.'
+   };
+ };
+ const realAI=callAI;
+ callAI=async function(action, context={}){
+   // AI handlers sometimes pass a partial context; always enrich using the active MUN.
+   const full=aiContext(context||{});
+   const terms=keywords([S.settings.agenda,S.settings.committee,S.settings.activeCountry,full.task||'',S.drafts.resProblem||''].join(' ')).slice(0,16);
+   const docs=(S.researchFiles||[]).filter(f=>f.collection==='committee'||f.collection==='research').slice(-14);
+   const candidates=[];
+   for(const file of docs){
+     try{
+       const indexed=await idbGet('researchIndex:'+file.id);
+       if(!indexed)continue;
+       const sections=(indexed.pages||[]).map(p=>({page:p.page,text:p.text||''}));
+       if(!sections.length&&indexed.text)sections.push({page:1,text:indexed.text});
+       const ranked=sections.map(p=>({...p,score:terms.reduce((n,t)=>n+((p.text||'').toLowerCase().includes(t.toLowerCase())?1:0),0)})).sort((a,b)=>b.score-a.score);
+       const selected=ranked.slice(0,3).map(x=>({page:x.page,excerpt:x.text.slice(0,1750),matchScore:x.score}));
+       candidates.push({file:file.name,collection:file.collection,pages: selected,score:selected.reduce((n,x)=>n+x.matchScore,0)});
+     }catch(e){console.warn('Índice no disponible',file.name,e)}
+   }
+   candidates.sort((a,b)=>b.score-a.score);
+   const snippets=candidates.slice(0,5);
+   // The server caps input at 60k chars. Preserve essential instructions and selected excerpts.
+   full.savedCommitteeEvidence=snippets;
+   full.importantContext='Usar el tema oficial de la conferencia, las intervenciones y el contenido textual real de archivos adjuntos. Si alguna fuente no contiene datos suficientes para una afirmación, señalar que falta verificar. Para resolución: cláusulas compatibles con mandato y propuestas surgidas en debate; no usar ejemplos genéricos.';
+   if(JSON.stringify(full).length>53000){full.handbookExtract=String(full.handbookExtract||'').slice(0,3800);full.interventions=(full.interventions||[]).slice(-12);full.savedSessionNotes.latestInterventions=full.savedSessionNotes.latestInterventions.slice(-12);full.savedCommitteeEvidence=snippets.slice(0,3).map(x=>({...x,pages:x.pages.slice(0,2)}))}
+   const out=await realAI(action,full);
+   if(typeof out==='string'&&out.trim()){S.drafts['lastAI_'+action]=out;save()}
+   return out;
+ };
+ // SpeechRecognition stops after silence, even in continuous mode. Restart on recoverable stops.
+ let wantsMic=false,micStopping=false,micRestartTimer=null,micErrors=0,micPartial='';
+ startMic=async function(){
+   if(wantsMic){wantsMic=false;micStopping=true;clearTimeout(micRestartTimer);try{micRecognition?.stop()}catch{}micActive=false;document.getElementById('micButton')?.classList.remove('recording');save();toast('Dictado detenido; transcripción guardada.');return}
+   const Speech=window.SpeechRecognition||window.webkitSpeechRecognition;
+   if(!Speech){toast('Dictado no disponible. Abre Chrome o Edge actualizado por HTTPS.');return}
+   if(!window.isSecureContext){toast('El micrófono requiere HTTPS.');return}
+   wantsMic=true;micStopping=false;micErrors=0;
+   if(navigator.mediaDevices?.getUserMedia){
+     try{const stream=await navigator.mediaDevices.getUserMedia({audio:true});stream.getTracks().forEach(t=>t.stop())}
+     catch(e){wantsMic=false;toast('Permite el micrófono en el navegador antes de grabar.');return}
+   }
+   function startCycle(){
+     if(!wantsMic)return;
+     try{
+       const rec=new Speech();micRecognition=rec;
+       rec.lang=S.settings.language==='English'?'en-US':S.settings.language==='Français'?'fr-FR':'es-CO';
+       rec.continuous=true;rec.interimResults=true;
+       const startBase=String(S.drafts.liveText||'').trim();let cycleFinal='';
+       rec.onstart=()=>{micActive=true;micErrors=0;document.getElementById('micButton')?.classList.add('recording');const b=document.getElementById('munovaMicStatus');if(b)b.textContent='🔴 Escuchando · recuperación automática tras pausas';};
+       rec.onresult=e=>{
+         let interim='';for(let i=e.resultIndex;i<e.results.length;i++){const piece=String(e.results[i][0]?.transcript||'').trim();if(e.results[i].isFinal){cycleFinal+=(cycleFinal?' ':'')+piece;}else{interim+=(interim?' ':'')+piece}}
+         const text=[startBase,cycleFinal,interim].filter(Boolean).join(' ').trim();
+         const box=document.getElementById('liveText');if(box)box.value=text;
+         S.drafts.liveText=text;
+         const w=document.getElementById('wordCount');if(w)w.textContent=(text?text.split(/\s+/).length:0)+' palabras';
+         save();
+       };
+       rec.onerror=e=>{
+         if(['not-allowed','service-not-allowed','audio-capture'].includes(e.error)){wantsMic=false;toast('Problema de micrófono: '+e.error)}
+         else if(e.error==='network'){micErrors++;if(micErrors>=4){wantsMic=false;toast('El dictado perdió la conexión. Tu texto quedó guardado; pulsa el micrófono para reintentar.')}}
+       };
+       rec.onend=()=>{
+         micActive=false;document.getElementById('micButton')?.classList.remove('recording');
+         // Never discard final words; the next recognition continues from here.
+         S.drafts.liveText=[startBase,cycleFinal].filter(Boolean).join(' ').trim()||S.drafts.liveText;
+         const box=document.getElementById('liveText');if(box)box.value=S.drafts.liveText;
+         save();
+         if(wantsMic&&!micStopping){const status=document.getElementById('munovaMicStatus');if(status)status.textContent='Reconectando reconocimiento de voz…';micRestartTimer=setTimeout(startCycle,500)}
+         else{const status=document.getElementById('munovaMicStatus');if(status)status.textContent='Dictado detenido; texto conservado.'}
+       };
+       rec.start();
+     }catch(err){
+       micErrors++;if(micErrors<4&&wantsMic)micRestartTimer=setTimeout(startCycle,1000);
+       else{wantsMic=false;toast('No se pudo reiniciar el micrófono. El texto está guardado.');}
+     }
+   }
+   startCycle();
+ };
+ // Finalize the latest text on tab changes or refresh. Persist on an interval as a safety net.
+ document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden'){S.drafts.liveText=document.getElementById('liveText')?.value??S.drafts.liveText;save();persistNow().catch(()=>{})}});
+ window.addEventListener('pagehide',()=>{S.drafts.liveText=document.getElementById('liveText')?.value??S.drafts.liveText;save()});
+ setInterval(()=>{if(!booting){S.drafts.liveText=document.getElementById('liveText')?.value??S.drafts.liveText;save()}},15000);
+ restoreAtStartup();
+ decorateBar();
+})();
+
+</script>
+</body></html>
